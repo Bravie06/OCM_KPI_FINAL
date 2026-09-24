@@ -10,12 +10,20 @@ from gui_ocm_net import OCMNetGUI
 from generate_ocm_net_report import (
     process_vendor_files,
     read_vendor_file,
+    _normalize_site_name,
     FILE_CONFIGS,
     KPI_MAP,
 )
 
 
 class TestGUIOCMNet(unittest.TestCase):
+    def test_normalize_site_name(self):
+        """Test normalization function for site names."""
+        self.assertEqual(_normalize_site_name(' ADM_004_H_MEIGANGA_U '), 'ADM_004_H_MEIGANGA_U')
+        self.assertEqual(_normalize_site_name('ADM-004 H  MEIGANGA_U'), 'ADM_004_H_MEIGANGA_U')
+        self.assertEqual(_normalize_site_name('ADM_004_H\xa0MEIGANGA_U'), 'ADM_004_H_MEIGANGA_U')
+        self.assertEqual(_normalize_site_name(None), '')
+
     def test_main_vendor_labels_contains_nokia_2g(self):
         """Verify ('N_2G', 'Nokia 2G') is in MAIN_VENDOR_LABELS."""
         keys = [k for k, _ in OCMNetGUI.MAIN_VENDOR_LABELS]
@@ -54,7 +62,7 @@ class TestGUIOCMNet(unittest.TestCase):
                 root.destroy()
 
     def test_process_vendor_files_nokia_2g(self):
-        """Test reading a dummy Nokia 2G Excel file and updating report."""
+        """Test reading a dummy Nokia 2G Excel file and updating report via full site_name matching."""
         import tempfile
         with tempfile.TemporaryDirectory() as tmpdir:
             # Create a mock Nokia 2G vendor excel file
@@ -86,30 +94,30 @@ class TestGUIOCMNet(unittest.TestCase):
 
             # Test read_vendor_file directly
             vdata = read_vendor_file(n2g_path, 'N_2G')
-            self.assertIn('ADM_004', vdata)
+            self.assertIn('ADM_004_N_SITE', vdata)
             d = date(2026, 5, 10)
-            self.assertIn(d, vdata['ADM_004'])
-            site_kpis = vdata['ADM_004'][d]
+            self.assertIn(d, vdata['ADM_004_N_SITE'])
+            site_kpis = vdata['ADM_004_N_SITE'][d]
             self.assertEqual(site_kpis.get('Avail2G'), 99.5)
             self.assertEqual(site_kpis.get('DailyCombinedCSTrafic (Kerl)'), 1.5)
             self.assertEqual(site_kpis.get('CSSR2G'), 98.2)
             self.assertEqual(site_kpis.get('DCR2G'), 0.8)
 
-            # Create mock OCM Daily template file
+            # Create mock OCM Daily template file with "Nom du Site" in Column A
             ocm_daily_path = os.path.join(tmpdir, 'OCM_Daily.xlsx')
             wb_ocm = openpyxl.Workbook()
             ws_avail = wb_ocm.active
             ws_avail.title = 'Avail2G'
             ws_avail.append(['Title Row'])
-            ws_avail.append(['ColA', 'Code du Site', 'ColC', 'ColD', 'ColE', 'ColF', 'ColG', 'ColH', date(2026, 5, 10)])
-            ws_avail.append(['Name', 'ADM_004', '', '', '', '', '', '', None])
+            ws_avail.append(['Nom du Site', 'Code du Site', 'ColC', 'ColD', 'ColE', 'ColF', 'ColG', 'ColH', date(2026, 5, 10)])
+            ws_avail.append(['ADM_004_N_SITE', 'ADM_004', '', '', '', '', '', '', None])
 
             # Add other sheets
             for sheet_name in ['DailyCombinedCSTrafic (Kerl)', 'CSSR2G', 'DCR2G']:
                 ws = wb_ocm.create_sheet(title=sheet_name)
                 ws.append(['Title Row'])
-                ws.append(['ColA', 'Code du Site', 'ColC', 'ColD', 'ColE', 'ColF', 'ColG', 'ColH', date(2026, 5, 10)])
-                ws.append(['Name', 'ADM_004', '', '', '', '', '', '', None])
+                ws.append(['Nom du Site', 'Code du Site', 'ColC', 'ColD', 'ColE', 'ColF', 'ColG', 'ColH', date(2026, 5, 10)])
+                ws.append(['ADM_004_N_SITE', 'ADM_004', '', '', '', '', '', '', None])
 
             wb_ocm.save(ocm_daily_path)
 

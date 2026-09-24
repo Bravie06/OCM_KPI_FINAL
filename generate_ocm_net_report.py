@@ -345,20 +345,19 @@ def _parse_date(val) -> date | None:
     return None
 
 
-def _extract_site_code(site_name: str) -> str | None:
+def _normalize_site_name(text: str | None) -> str:
     """
-    Extract the 'XXX_NNN' site code from site name strings such as:
-      'ADM_004_H_MEIGANGA_U'  →  'ADM_004'
-      'CTR_020_Z_Masque'      →  'CTR_020'
-      'LIT_103_Z_Makepe-...'  →  'LIT_103'
-    Purely numeric strings (aggregate rows) return None.
+    Light normalization of site names for comparison purposes:
+    - Replaces non-breaking spaces ( ) with space
+    - Converts to uppercase
+    - Normalizes separators (spaces, dashes, underscores) to single underscores
+    - Strips leading/trailing spaces/underscores
     """
-    if not site_name:
-        return None
-    parts = _normalise(site_name).split('_')
-    if len(parts) >= 2 and re.match(r'^\d+$', parts[1]):
-        return f'{parts[0]}_{parts[1]}'
-    return None
+    if not text:
+        return ''
+    s = str(text).replace(' ', ' ').strip().upper()
+    s = re.sub(r'[\s\-_]+', '_', s)
+    return s
 
 
 def _date_to_week_key(d: date) -> str:
@@ -380,7 +379,7 @@ def read_vendor_file(
 ) -> dict[str, dict[date, dict[str, float]]]:
     """
     Parse one vendor raw file.
-    Returns {site_code: {date: {sheet_name: value}}}.
+    Returns {site_name: {date: {sheet_name: value}}}.
     """
     cfg = FILE_CONFIGS[vendor_gen]
     logger.debug(f'  Reading {vendor_gen}: {os.path.basename(filepath)}')
@@ -448,7 +447,7 @@ def read_vendor_file(
 
     # Use accumulator to handle files with multiple rows per site/day
     # (e.g. ZTE packet-loss file with one row per IP path).
-    # Structure: {site_code: {date: {sheet_name: [values]}}}
+    # Structure: {site_name: {date: {sheet_name: [values]}}}
     accum: dict[str, dict[date, dict[str, list[float]]]] = defaultdict(
         lambda: defaultdict(lambda: defaultdict(list))
     )
@@ -466,8 +465,9 @@ def read_vendor_file(
             skipped += 1
             continue
 
-        site_code = _extract_site_code(site_str)
-        if not site_code:
+        site_name = site_str
+        norm_site = _normalize_site_name(site_name)
+        if not norm_site:
             skipped += 1
             continue
 
@@ -479,23 +479,23 @@ def read_vendor_file(
             raw = row[col_idx] if col_idx < len(row) else None
             val = _to_float(raw)
             if val is not None:
-                accum[site_code][d][sheet_name].append(round(val * mult, 6))
+                accum[site_name][d][sheet_name].append(round(val * mult, 6))
 
         for sheet_name, idx_a, idx_b, fn in computed_specs:
             val_a = row[idx_a] if idx_a < len(row) else None
             val_b = row[idx_b] if idx_b < len(row) else None
             val = fn(val_a, val_b)
             if val is not None:
-                accum[site_code][d][sheet_name].append(val)
+                accum[site_name][d][sheet_name].append(val)
 
     wb.close()
 
     # Collapse accumulator: average multiple values for the same site/date/sheet
     result: dict[str, dict[date, dict[str, float]]] = {}
-    for site_code, date_map in accum.items():
-        result[site_code] = {}
+    for site_name, date_map in accum.items():
+        result[site_name] = {}
         for d, sheet_map in date_map.items():
-            result[site_code][d] = {
+            result[site_name][d] = {
                 s: round(sum(vals) / len(vals), 6)
                 for s, vals in sheet_map.items()
             }
@@ -513,22 +513,22 @@ def _aggregate(
     """
     Aggregate daily data to weekly or monthly using key_fn(date) → period_key.
     Additive sheets (traffic volumes) are summed; all others are averaged.
-    Returns {site_code: {period_key: {sheet: aggregated_value}}}.
+    Returns {site_name: {period_key: {sheet: aggregated_value}}}.
     """
     buckets: dict[str, dict[str, dict[str, list[float]]]] = defaultdict(
         lambda: defaultdict(lambda: defaultdict(list))
     )
-    for site_code, date_map in daily.items():
+    for site_name, date_map in daily.items():
         for d, sheet_map in date_map.items():
             pk = key_fn(d)
             for sheet, val in sheet_map.items():
-                buckets[site_code][pk][sheet].append(val)
+                buckets[site_name][pk][sheet].append(val)
 
     result: dict[str, dict[str, dict[str, float]]] = {}
-    for site_code, pk_map in buckets.items():
-        result[site_code] = {}
+    for site_name, pk_map in buckets.items():
+        result[site_name] = {}
         for pk, sheet_map in pk_map.items():
-            result[site_code][pk] = {
+            result[site_name][pk] = {
                 s: round(sum(vals), 4) if s in ADDITIVE_SHEETS
                    else round(sum(vals) / len(vals), 4)
                 for s, vals in sheet_map.items()
@@ -607,7 +607,7 @@ def _apply_pl_cf(ws, sheet_name: str, last_data_col: int) -> None:
 
 def update_ocm_file(
     filepath: str,
-    data: dict,          # {site_code: {period_key: {sheet: value}}}
+    data: dict,          # {site_name: {period_key: {sheet: value}}}
     period: str,         # 'daily' | 'weekly' | 'monthly'
     log_fn=None,
     sheets_filter: set[str] | None = None,  # if set, only write these sheets
@@ -619,7 +619,7 @@ def update_ocm_file(
       Row 1  (1-based) : empty / title row
       Row 2  (1-based) : header — site metadata in cols A-C, period labels from col D
       Row 3+ (1-based) : one site per row
-      Col B             : 'Code du Site'  (used for site lookup)
+      Col A             : 'Nom du Site'  (used for site lookup)
     """
     def _log(msg):
         if log_fn:
@@ -642,8 +642,17 @@ def update_ocm_file(
 
         # ── Build period_key → column-number map from header row (row 2) ──────
         period_col: dict = {}
-        header_row = ws[2]
-        for cell in header_row[3:]:
+        header_cells = list(ws[2])
+
+        # Locate 'Nom du Site' column dynamically in row 2 (default col A, index 0)
+        site_col_idx = 0
+        for idx, cell in enumerate(header_cells):
+            cv = str(cell.value or '').strip()
+            if cv.lower() == 'nom du site':
+                site_col_idx = idx
+                break
+
+        for cell in header_cells[3:]:
             hv = cell.value
             if hv is None:
                 continue
@@ -662,19 +671,22 @@ def update_ocm_file(
                 elif period == 'monthly' and re.match(r'^\d{4}M\d{2}$', hv):
                     period_col[hv] = cell.column
 
-        # ── Build site_code → row-number map from column B (Code du Site) ─────
+        # ── Build norm_site → row-number map from 'Nom du Site' column ────────
         site_row: dict[str, int] = {}
-        for row in ws.iter_rows(min_row=3, max_col=2, values_only=False):
-            code_cell = row[1]  # column B (0-indexed = index 1)
-            if code_cell.value:
-                site_row[str(code_cell.value).strip()] = code_cell.row
+        for row in ws.iter_rows(min_row=3, max_col=site_col_idx + 1, values_only=False):
+            name_cell = row[site_col_idx]
+            if name_cell.value:
+                norm = _normalize_site_name(name_cell.value)
+                if norm:
+                    site_row[norm] = name_cell.row
 
         # ── Write values ───────────────────────────────────────────────────────
         written = 0
-        for site_code, period_map in data.items():
-            if site_code not in site_row:
+        for site_name, period_map in data.items():
+            norm_key = _normalize_site_name(site_name)
+            if norm_key not in site_row:
                 continue
-            rn = site_row[site_code]
+            rn = site_row[norm_key]
             for pk, sheet_map in period_map.items():
                 if sheet_name not in sheet_map:
                     continue
@@ -761,7 +773,7 @@ def process_vendor_files(
             return
 
     # ── Collect all daily data ────────────────────────────────────────────────
-    # Structure: {site_code: {date: {sheet: value}}}
+    # Structure: {site_name: {date: {sheet: value}}}
     all_daily: dict[str, dict[date, dict[str, float]]] = defaultdict(
         lambda: defaultdict(dict)
     )
@@ -773,14 +785,14 @@ def process_vendor_files(
         log(f'Reading {vg} …')
         try:
             vdata = read_vendor_file(fp, vg)
-            for site_code, date_map in vdata.items():
+            for site_name, date_map in vdata.items():
                 for d, sheet_map in date_map.items():
                     for sheet, val in sheet_map.items():
-                        existing = all_daily[site_code][d].get(sheet)
+                        existing = all_daily[site_name][d].get(sheet)
                         if existing is not None and sheet in ADDITIVE_SHEETS:
-                            all_daily[site_code][d][sheet] = round(existing + val, 6)
+                            all_daily[site_name][d][sheet] = round(existing + val, 6)
                         else:
-                            all_daily[site_code][d][sheet] = val
+                            all_daily[site_name][d][sheet] = val
         except Exception as exc:
             import traceback
             log(f'  ERROR reading {vg}: {exc}')
