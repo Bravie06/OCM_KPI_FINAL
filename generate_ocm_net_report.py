@@ -345,12 +345,9 @@ def _parse_date(val) -> date | None:
     return None
 
 
-def _extract_site_code(site_name: str) -> str | None:
+def _extract_standard_site_code(site_name: str) -> str | None:
     """
-    Extract the 'XXX_NNN' site code from site name strings such as:
-      'ADM_004_H_MEIGANGA_U'  →  'ADM_004'
-      'CTR_020_Z_Masque'      →  'CTR_020'
-      'LIT_103_Z_Makepe-...'  →  'LIT_103'
+    Extract standard XXX_NNN site code for Huawei / Nokia site names.
     Purely numeric strings (aggregate rows) return None.
     """
     if not site_name:
@@ -359,6 +356,55 @@ def _extract_site_code(site_name: str) -> str | None:
     if len(parts) >= 2 and re.match(r'^\d+$', parts[1]):
         return f'{parts[0]}_{parts[1]}'
     return None
+
+
+def _extract_zte_site_code(site_name: str) -> str | None:
+    """
+    Extract site code for ZTE site names according to Excel formula logic:
+    =IF(OR(ISERROR(FIND("_Z_",A3)),ISERROR(FIND("_URZ_",A3))),
+        LEFT(A3,FIND("_",A3,FIND("_",A3)+1)-1),
+        TRIM(LEFT(A3,MIN(IFERROR(FIND("_Z_",A3),LEN(A3)),IFERROR(FIND("_URZ_",A3),LEN(A3)))-1)))
+    """
+    if not site_name:
+        return None
+    s = _normalise(site_name)
+    if not s:
+        return None
+
+    z_in = '_Z_' in s
+    urz_in = '_URZ_' in s
+
+    if not z_in or not urz_in:
+        first_u = s.find('_')
+        if first_u != -1:
+            second_u = s.find('_', first_u + 1)
+            if second_u != -1:
+                return s[:second_u].strip()
+        return s.strip()
+    else:
+        z_pos = s.find('_Z_')
+        urz_pos = s.find('_URZ_')
+        min_pos = min(z_pos, urz_pos)
+        return s[:min_pos].strip()
+
+
+def extract_site_code_for_vendor(site_name: str, vendor: str | None) -> str | None:
+    """
+    Extract site code from site_name based on vendor ('HUAWEI', 'NOKIA', 'ZTE').
+    Defaults to standard XXX_NNN if vendor is missing or unrecognized.
+    """
+    if not site_name:
+        return None
+    v = (vendor or '').strip().upper()
+    if v == 'ZTE':
+        return _extract_zte_site_code(site_name)
+    else:
+        return _extract_standard_site_code(site_name)
+
+
+def _extract_site_code(site_name: str) -> str | None:
+    """Deprecated legacy extraction function; defaults to standard logic."""
+    return _extract_standard_site_code(site_name)
 
 
 def _date_to_week_key(d: date) -> str:
@@ -466,7 +512,8 @@ def read_vendor_file(
             skipped += 1
             continue
 
-        site_code = _extract_site_code(site_str)
+        vendor_name = 'ZTE' if vendor_gen.startswith('Z_') else ('NOKIA' if vendor_gen.startswith('N_') else 'HUAWEI')
+        site_code = extract_site_code_for_vendor(site_str, vendor_name)
         if not site_code:
             skipped += 1
             continue
@@ -605,6 +652,42 @@ def _apply_pl_cf(ws, sheet_name: str, last_data_col: int) -> None:
 
 # ─── OCM FILE WRITER ──────────────────────────────────────────────────────────
 
+def build_ocm_reference_table(ws) -> dict[str, dict]:
+    """
+    Build reference table from OCM worksheet rows (starting at row 3).
+    Cols: Col A (index 0) = Site Name, Col B (index 1) = Site Code, Col C (index 2) = Vendor.
+    Returns dictionary mapping calculated site_code -> {'row': row_number, 'site_name': name, 'raw_code': raw_code, 'vendor': vendor}.
+    """
+    ref_table = {}
+    for row in ws.iter_rows(min_row=3, max_col=3, values_only=False):
+        name_cell = row[0] if len(row) > 0 else None
+        code_cell = row[1] if len(row) > 1 else None
+        vendor_cell = row[2] if len(row) > 2 else None
+
+        raw_name = str(name_cell.value).strip() if name_cell and name_cell.value is not None else ''
+        raw_code = str(code_cell.value).strip() if code_cell and code_cell.value is not None else ''
+        vendor = str(vendor_cell.value).strip() if vendor_cell and vendor_cell.value is not None else ''
+
+        if not raw_code and not raw_name:
+            continue
+
+        site_code = extract_site_code_for_vendor(raw_code or raw_name, vendor)
+        if not site_code and raw_code:
+            site_code = raw_code
+
+        if site_code:
+            row_num = row[0].row if row else None
+            ref_table[site_code] = {
+                'row': row_num,
+                'site_name': raw_name,
+                'raw_code': raw_code,
+                'vendor': vendor,
+            }
+            if raw_code and raw_code not in ref_table:
+                ref_table[raw_code] = ref_table[site_code]
+    return ref_table
+
+
 def update_ocm_file(
     filepath: str,
     data: dict,          # {site_code: {period_key: {sheet: value}}}
@@ -662,12 +745,9 @@ def update_ocm_file(
                 elif period == 'monthly' and re.match(r'^\d{4}M\d{2}$', hv):
                     period_col[hv] = cell.column
 
-        # ── Build site_code → row-number map from column B (Code du Site) ─────
-        site_row: dict[str, int] = {}
-        for row in ws.iter_rows(min_row=3, max_col=2, values_only=False):
-            code_cell = row[1]  # column B (0-indexed = index 1)
-            if code_cell.value:
-                site_row[str(code_cell.value).strip()] = code_cell.row
+        # ── Build site_code → row-number reference map using vendor column ─────
+        ref_table = build_ocm_reference_table(ws)
+        site_row = {code: info['row'] for code, info in ref_table.items()}
 
         # ── Write values ───────────────────────────────────────────────────────
         written = 0
