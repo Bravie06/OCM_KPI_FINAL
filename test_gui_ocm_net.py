@@ -130,3 +130,96 @@ class TestGUIOCMNet(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+from generate_ocm_net_report import (
+    _extract_zte_site_code,
+    _extract_standard_site_code,
+    extract_site_code_for_vendor,
+    build_ocm_reference_table,
+)
+
+
+class TestVendorSiteCodeExtraction(unittest.TestCase):
+    def test_zte_site_code_extraction(self):
+        """Test ZTE specific site code extraction formula implementation."""
+        # Both _Z_ and _URZ_ present
+        self.assertEqual(_extract_zte_site_code('CTR_020_Z_URZ_Masque'), 'CTR_020')
+        self.assertEqual(_extract_zte_site_code('ADM_004_URZ_Z_Meiganga'), 'ADM_004')
+
+        # Only _Z_ or only _URZ_ or neither -> falls back to 2nd underscore
+        self.assertEqual(_extract_zte_site_code('CTR_020_Z_Masque'), 'CTR_020')
+        self.assertEqual(_extract_zte_site_code('LIT_103_URZ_Makepe'), 'LIT_103')
+        self.assertEqual(_extract_zte_site_code('DLA_001_OTHER_NAME'), 'DLA_001')
+        self.assertEqual(_extract_zte_site_code('SIMPLE_SITE'), 'SIMPLE_SITE')
+        self.assertEqual(_extract_zte_site_code('SINGLEWORD'), 'SINGLEWORD')
+        self.assertIsNone(_extract_zte_site_code(''))
+
+    def test_standard_site_code_extraction(self):
+        """Test Huawei / Nokia standard XXX_NNN extraction."""
+        self.assertEqual(_extract_standard_site_code('ADM_004_H_MEIGANGA_U'), 'ADM_004')
+        self.assertEqual(_extract_standard_site_code('CTR_020_N_SITE'), 'CTR_020')
+        self.assertIsNone(_extract_standard_site_code('3000000'))  # aggregate numeric row
+        self.assertIsNone(_extract_standard_site_code(''))
+
+    def test_extract_site_code_for_vendor(self):
+        """Test vendor dispatcher function."""
+        self.assertEqual(extract_site_code_for_vendor('CTR_020_Z_URZ_Masque', 'ZTE'), 'CTR_020')
+        self.assertEqual(extract_site_code_for_vendor('ADM_004_H_MEIGANGA_U', 'HUAWEI'), 'ADM_004')
+        self.assertEqual(extract_site_code_for_vendor('LIT_103_N_SITE', 'NOKIA'), 'LIT_103')
+        self.assertEqual(extract_site_code_for_vendor('LIT_103_N_SITE', None), 'LIT_103')
+
+    def test_process_vendor_files_zte_multi_vendor(self):
+        """Test end-to-end processing with ZTE and multi-vendor OCM file."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Mock ZTE 2G file
+            z2g_path = os.path.join(tmpdir, 'Z 2G_sample.xlsx')
+            wb_z2g = openpyxl.Workbook()
+            ws_z2g = wb_z2g.active
+            ws_z2g.append([
+                'Begin Time',
+                'SITE Name',
+                'ORA_2G_TCH Availability Normal TRXs',
+                'ORA_2G_CS_TRAFFIC',
+                'ORA_2G_CSSR_CS_New(%)',
+                'ORA_2G_Call_Drop_CS_New(%)',
+            ])
+            ws_z2g.append([
+                '2026-05-10 00:00:00',
+                'CTR_020_Z_URZ_Masque',
+                0.995,  # 0.995 ratio -> 99.5%
+                1500.0,  # 1500 Erl -> 1.5 Kerl
+                98.5,
+                0.5,
+            ])
+            wb_z2g.save(z2g_path)
+
+            # Mock OCM Daily file
+            ocm_daily_path = os.path.join(tmpdir, 'OCM_Daily.xlsx')
+            wb_ocm = openpyxl.Workbook()
+
+            # Setup sheets
+            sheets = ['Avail2G', 'DailyCombinedCSTrafic (Kerl)', 'CSSR2G', 'DCR2G']
+            for i, sheet_name in enumerate(sheets):
+                ws = wb_ocm.active if i == 0 else wb_ocm.create_sheet(title=sheet_name)
+                ws.title = sheet_name
+                ws.append(['Title Row'])
+                ws.append(['Nom du Site', 'Code du Site', 'Vendor', 'ColD', 'ColE', 'ColF', 'ColG', 'ColH', date(2026, 5, 10)])
+                # Row 3: ZTE site
+                ws.append(['CTR_020_Z_URZ_Masque', 'CTR_020_URZ', 'ZTE', '', '', '', '', '', None])
+
+            wb_ocm.save(ocm_daily_path)
+
+            # Process files
+            process_vendor_files(
+                vendor_files={'Z_2G': z2g_path},
+                ocm_files={'daily': ocm_daily_path},
+                granularities={'daily'},
+            )
+
+            # Verify results
+            wb_res = openpyxl.load_workbook(ocm_daily_path, data_only=True)
+            self.assertEqual(wb_res['Avail2G'].cell(row=3, column=9).value, 99.5)
+            self.assertEqual(wb_res['DailyCombinedCSTrafic (Kerl)'].cell(row=3, column=9).value, 1.5)
+            self.assertEqual(wb_res['CSSR2G'].cell(row=3, column=9).value, 98.5)
+            self.assertEqual(wb_res['DCR2G'].cell(row=3, column=9).value, 0.5)
